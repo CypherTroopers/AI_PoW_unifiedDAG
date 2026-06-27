@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -68,6 +70,11 @@ const (
 
 	sealVersion  = uint16(1)
 	proofVersion = 1
+
+	defaultSidecarExt     = ".sidecar"
+	sidecarMagic          = "AIDGSC1!" // exactly 8 bytes
+	sidecarVersion        = 1
+	sidecarHeaderReserved = uint64(1 << 20) // 1 MiB reserved JSON header
 )
 
 const (
@@ -107,12 +114,13 @@ const (
 type Config struct {
 	Mode string
 
-	OutPath   string
-	DagPath   string
-	MetaPath  string
-	ModelPath string
-	ExtractTo string
-	ProofPath string
+	OutPath     string
+	DagPath     string
+	MetaPath    string
+	SidecarPath string
+	ModelPath   string
+	ExtractTo   string
+	ProofPath   string
 
 	SizeGB   uint64
 	PageSize uint64
@@ -157,6 +165,9 @@ type Manifest struct {
 	AIDagLeafCount     uint64 `json:"aidagLeafCount"`
 	TensorLeafCount    uint64 `json:"tensorLeafCount"`
 	PoWCommitLeafCount uint64 `json:"powCommitLeafCount"`
+
+	MerkleSidecar  string `json:"merkleSidecar"`
+	SidecarVersion int    `json:"sidecarVersion"`
 
 	ModelName      string `json:"modelName,omitempty"`
 	ModelFormat    string `json:"modelFormat,omitempty"`
@@ -239,6 +250,41 @@ type MerkleTree struct {
 	levels [][][32]byte
 }
 
+type SidecarLevel struct {
+	Level  int    `json:"level"`
+	Count  uint64 `json:"count"`
+	Offset uint64 `json:"offset"`
+	Bytes  uint64 `json:"bytes"`
+}
+
+type SidecarManifest struct {
+	Version       int    `json:"version"`
+	HashAlgorithm string `json:"hashAlgorithm"`
+	MerkleVersion int    `json:"merkleVersion"`
+	CreatedAt     string `json:"createdAt"`
+
+	PageSize       uint64 `json:"pageSize"`
+	HeaderSize     uint64 `json:"headerSize"`
+	PayloadSize    uint64 `json:"payloadSize"`
+	TotalPages     uint64 `json:"totalPages"`
+	ModelStartPage uint64 `json:"modelStartPage"`
+	ModelPageCount uint64 `json:"modelPageCount"`
+
+	ManifestRoot  string `json:"manifestRoot"`
+	AIDagRoot     string `json:"aidagRoot"`
+	TensorRoot    string `json:"tensorRoot"`
+	PoWCommitRoot string `json:"powCommitRoot"`
+
+	PoWLevels    []SidecarLevel `json:"powLevels"`
+	TensorLevels []SidecarLevel `json:"tensorLevels"`
+}
+
+type MerkleSidecarReader struct {
+	path string
+	file *os.File
+	meta SidecarManifest
+}
+
 type MerkleProofStep struct {
 	Side string `json:"side"`
 	Hash string `json:"hash"`
@@ -281,8 +327,7 @@ type AISealProof struct {
 }
 
 type ProofTrees struct {
-	PoW    *MerkleTree
-	Tensor *MerkleTree
+	Sidecar *MerkleSidecarReader
 }
 
 type pageProofMaterial struct {
@@ -303,6 +348,7 @@ func main() {
 	flag.StringVar(&cfg.OutPath, "out", "./unified-aidag-128g.bin", "output unified AI-DAG path for gen mode")
 	flag.StringVar(&cfg.DagPath, "dag", "", "AI-DAG path for verify/extract/info/prove mode")
 	flag.StringVar(&cfg.MetaPath, "meta", "", "metadata path; default is <dag>.meta or <out>.meta")
+	flag.StringVar(&cfg.SidecarPath, "sidecar", "", "Merkle sidecar tree path; default is <dag>.sidecar or <out>.sidecar")
 	flag.StringVar(&cfg.ModelPath, "model", "", "model file path to embed into unified AI-DAG")
 	flag.StringVar(&cfg.ExtractTo, "extract-out", "./extracted-model.bin", "output model path for extract mode")
 	flag.StringVar(&cfg.ProofPath, "proof", "./aiseal-proof.json", "AISeal proof JSON path for prove/verify-proof mode")
@@ -358,10 +404,17 @@ func runGenerate(cfg Config) error {
 	if cfg.MetaPath == "" {
 		cfg.MetaPath = cfg.OutPath + ".meta"
 	}
+	if cfg.SidecarPath == "" {
+		cfg.SidecarPath = cfg.OutPath + defaultSidecarExt
+	}
 
 	totalBytes := cfg.SizeGB * oneGiB
 	totalPages := totalBytes / cfg.PageSize
 	payloadSize := cfg.PageSize - unifiedHeaderSize
+
+	if totalPages > uint64(maxInt()) {
+		return fmt.Errorf("too many pages for strict page tracking: totalPages=%d", totalPages)
+	}
 
 	modelHash, modelSize, err := hashFile(cfg.ModelPath)
 	if err != nil {
@@ -376,9 +429,6 @@ func runGenerate(cfg Config) error {
 		return fmt.Errorf("model does not fit: modelEndPage=%d totalPages=%d", modelEndPage, totalPages)
 	}
 
-	// Important: fields that are local/non-consensus are left empty until after
-	// the DAG pages are committed. This makes page0 and all roots deterministic
-	// for the same model hash, seed, page size, and total size.
 	manifest := Manifest{
 		Version:       manifestVersion,
 		Name:          "ColossusX Unified PoW+AI-DAG v1",
@@ -398,6 +448,9 @@ func runGenerate(cfg Config) error {
 		TensorLeafCount:    modelPageCount,
 		PoWCommitLeafCount: totalPages,
 
+		SidecarVersion: sidecarVersion,
+		MerkleSidecar:  cfg.SidecarPath,
+
 		ModelSize:      modelSize,
 		ModelHash:      "0x" + fmtHash(modelHash),
 		ModelStartPage: modelStartPage,
@@ -412,6 +465,7 @@ func runGenerate(cfg Config) error {
 	fmt.Println("===== ColossusX Unified PoW+AI-DAG v1 Generator =====")
 	fmt.Printf("output       : %s\n", cfg.OutPath)
 	fmt.Printf("metadata     : %s\n", cfg.MetaPath)
+	fmt.Printf("sidecar      : %s\n", cfg.SidecarPath)
 	fmt.Printf("hash         : %s\n", manifest.HashAlgorithm)
 	fmt.Printf("merkle       : version %d\n", manifest.MerkleVersion)
 	fmt.Printf("size         : %d GiB\n", cfg.SizeGB)
@@ -427,28 +481,39 @@ func runGenerate(cfg Config) error {
 	fmt.Printf("workers      : %d\n", cfg.Workers)
 	fmt.Println("=====================================================")
 
-	if dir := filepath.Dir(cfg.OutPath); dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return err
-		}
+	if err := preflightAtomicTargets(cfg.Force, cfg.OutPath, cfg.MetaPath, cfg.SidecarPath); err != nil {
+		return err
 	}
 
-	if _, err := os.Stat(cfg.OutPath); err == nil && !cfg.Force {
-		return fmt.Errorf("output exists: %s ; use --force", cfg.OutPath)
+	if err := ensureParentDir(cfg.OutPath); err != nil {
+		return err
+	}
+	if err := ensureParentDir(cfg.MetaPath); err != nil {
+		return err
+	}
+	if err := ensureParentDir(cfg.SidecarPath); err != nil {
+		return err
 	}
 
-	out, err := os.OpenFile(cfg.OutPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0644)
+	tmpDagPath := tempPathFor(cfg.OutPath)
+	tmpSidecarPath := tempPathFor(cfg.SidecarPath)
+	defer os.Remove(tmpDagPath)
+	defer os.Remove(tmpSidecarPath)
+
+	out, err := os.OpenFile(tmpDagPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 
 	if err := out.Truncate(int64(totalBytes)); err != nil {
+		_ = out.Close()
 		return fmt.Errorf("truncate: %w", err)
 	}
 
 	start := time.Now()
 	var written uint64
+	var writtenPages uint64
+	seenPages := make([]uint8, int(totalPages))
 
 	jobs := make(chan Job, cfg.Workers*8)
 	results := make(chan Result, cfg.Workers*8)
@@ -456,13 +521,7 @@ func runGenerate(cfg Config) error {
 	var wg sync.WaitGroup
 	for i := 0; i < cfg.Workers; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for job := range jobs {
-				page, err := buildUnifiedPage(cfg, manifest, job)
-				results <- Result{PageIndex: job.PageIndex, Data: page, Err: err}
-			}
-		}()
+		go recoveredPageWorker(&wg, jobs, results, cfg, manifest)
 	}
 
 	producerErr := make(chan error, 1)
@@ -500,6 +559,26 @@ func runGenerate(cfg Config) error {
 			continue
 		}
 
+		if res.PageIndex >= totalPages {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("worker returned out-of-range page: %d >= %d", res.PageIndex, totalPages)
+			}
+			continue
+		}
+		if seenPages[int(res.PageIndex)] != 0 {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("duplicate page result: %d", res.PageIndex)
+			}
+			continue
+		}
+
+		if err := strictValidateBuiltPage(res.Data, res.PageIndex, cfg.PageSize); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
 		offset := res.PageIndex * cfg.PageSize
 		n, err := out.WriteAt(res.Data, int64(offset))
 		if err != nil {
@@ -514,25 +593,46 @@ func runGenerate(cfg Config) error {
 			}
 			continue
 		}
+
+		seenPages[int(res.PageIndex)] = 1
 		atomic.AddUint64(&written, cfg.PageSize)
+		atomic.AddUint64(&writtenPages, 1)
 	}
 	close(progressDone)
 
 	if err := <-producerErr; err != nil {
+		_ = out.Close()
 		return err
 	}
 	if firstErr != nil {
+		_ = out.Close()
 		return firstErr
+	}
+	if writtenPages != totalPages {
+		_ = out.Close()
+		missing := firstMissingPage(seenPages)
+		return fmt.Errorf("strict page commit failed: writtenPages=%d totalPages=%d firstMissing=%d", writtenPages, totalPages, missing)
+	}
+	if written != totalBytes {
+		_ = out.Close()
+		return fmt.Errorf("strict byte commit failed: written=%d total=%d", written, totalBytes)
 	}
 
 	if err := out.Sync(); err != nil {
-		return fmt.Errorf("sync: %w", err)
+		_ = out.Close()
+		return fmt.Errorf("sync dag: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("close dag: %w", err)
 	}
 
 	fmt.Println()
 	fmt.Println("computing BLAKE3 Merkle roots from generated AI-DAG...")
-	roots, err := computeRootsFromFile(cfg.OutPath, cfg.PageSize)
+	roots, err := computeRootsFromFile(tmpDagPath, cfg.PageSize)
 	if err != nil {
+		return err
+	}
+	if err := validateRootsNonEmpty(roots, manifest); err != nil {
 		return err
 	}
 
@@ -550,10 +650,30 @@ func runGenerate(cfg Config) error {
 	manifest.GenerationTime = time.Now().UTC().Format(time.RFC3339)
 	manifest.ModelName = filepath.Base(cfg.ModelPath)
 	manifest.ModelFormat = guessModelFormat(cfg.ModelPath)
-	manifest.UnifiedLayout = "page0=index; page1..modelEnd=model shards; remaining pages=deterministic filler; every page is PoW-mixable; roots are BLAKE3 Merkle roots"
+	manifest.UnifiedLayout = "page0=index; page1..modelEnd=model shards; remaining pages=deterministic filler; every page is PoW-mixable; roots are BLAKE3 Merkle roots; PoW/Tensor proof paths are stored in mandatory Merkle sidecar"
 
-	if err := writeManifest(cfg.MetaPath, manifest); err != nil {
+	if err := validateManifestBasics(manifest); err != nil {
 		return err
+	}
+
+	fmt.Println("building mandatory Merkle sidecar tree...")
+	if _, err := buildMerkleSidecarTempFromDAG(tmpDagPath, tmpSidecarPath, manifest); err != nil {
+		return err
+	}
+
+	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	if err := commitAtomicPath(tmpDagPath, cfg.OutPath, cfg.Force); err != nil {
+		return fmt.Errorf("commit dag: %w", err)
+	}
+	if err := commitAtomicPath(tmpSidecarPath, cfg.SidecarPath, cfg.Force); err != nil {
+		return fmt.Errorf("commit sidecar: %w", err)
+	}
+	if err := writeFileAtomic(cfg.MetaPath, manifestBytes, 0644, cfg.Force); err != nil {
+		return fmt.Errorf("commit manifest: %w", err)
 	}
 
 	fmt.Println("Unified AI-DAG generated successfully")
@@ -566,9 +686,10 @@ func runGenerate(cfg Config) error {
 	fmt.Printf("PoWCommitLeafCount : %d\n", manifest.PoWCommitLeafCount)
 	fmt.Printf("output             : %s\n", cfg.OutPath)
 	fmt.Printf("metadata           : %s\n", cfg.MetaPath)
+	fmt.Printf("sidecar            : %s\n", cfg.SidecarPath)
 
 	if cfg.Verify {
-		return verifyDagAgainstManifest(cfg.OutPath, cfg.MetaPath)
+		return verifyDagAgainstManifest(cfg.OutPath, cfg.MetaPath, cfg.SidecarPath)
 	}
 
 	return nil
@@ -607,6 +728,26 @@ func validateGenerateConfig(cfg *Config) error {
 		return fmt.Errorf("model not found: %s", cfg.ModelPath)
 	}
 	return nil
+}
+
+func recoveredPageWorker(wg *sync.WaitGroup, jobs <-chan Job, results chan<- Result, cfg Config, manifest Manifest) {
+	defer wg.Done()
+
+	for job := range jobs {
+		func(job Job) {
+			defer func() {
+				if r := recover(); r != nil {
+					results <- Result{
+						PageIndex: job.PageIndex,
+						Err:       fmt.Errorf("worker panic while building page %d: %v\n%s", job.PageIndex, r, debug.Stack()),
+					}
+				}
+			}()
+
+			page, err := buildUnifiedPage(cfg, manifest, job)
+			results <- Result{PageIndex: job.PageIndex, Data: page, Err: err}
+		}(job)
+	}
 }
 
 func enqueueModelJobs(jobs chan<- Job, cfg Config, manifest Manifest) error {
@@ -710,12 +851,31 @@ func buildUnifiedPage(cfg Config, manifest Manifest, job Job) ([]byte, error) {
 	// Write final header.
 	writeHeader(page[:unifiedHeaderSize], header)
 
-	// Sanity check. pageCommitHash ignores the PageHash slot, so this must stay stable.
-	if got := pageCommitHash(page); got != pageCommit {
-		return nil, fmt.Errorf("unstable page commit at page %d", job.PageIndex)
+	if err := strictValidateBuiltPage(page, job.PageIndex, cfg.PageSize); err != nil {
+		return nil, err
 	}
 
 	return page, nil
+}
+
+func strictValidateBuiltPage(page []byte, pageIndex uint64, pageSize uint64) error {
+	hdr, payloadHash, pageCommit, err := verifyPageBytes(page, pageIndex, pageSize)
+	if err != nil {
+		return err
+	}
+	if isZeroHash(payloadHash) {
+		return fmt.Errorf("strict page commit failed: zero payload hash at page %d", pageIndex)
+	}
+	if isZeroHash(pageCommit) {
+		return fmt.Errorf("strict page commit failed: zero page commit at page %d", pageIndex)
+	}
+	if hdr.PayloadHash != payloadHash {
+		return fmt.Errorf("strict page commit failed: header payload hash mismatch at page %d", pageIndex)
+	}
+	if hdr.PageHash != pageCommit {
+		return fmt.Errorf("strict page commit failed: header page commit mismatch at page %d", pageIndex)
+	}
+	return nil
 }
 
 func buildIndexPayload(manifest Manifest, max int) ([]byte, error) {
@@ -743,6 +903,8 @@ func canonicalManifestForIndex(m Manifest) Manifest {
 	m.ModelName = ""
 	m.ModelFormat = ""
 	m.UnifiedLayout = ""
+	m.MerkleSidecar = ""
+	m.SidecarVersion = 0
 	return m
 }
 
@@ -915,7 +1077,6 @@ func computeRootsFromFile(path string, pageSize uint64) (Roots, error) {
 			tensor.AddLeaf(tensorLeaf)
 		}
 
-		// Every page, including model shard pages and index page, is PoW-mixable.
 		powLeaf := merkleLeafHash(treePoW, hdr, payloadHash, pageCommit)
 		powc.AddLeaf(powLeaf)
 
@@ -968,14 +1129,10 @@ func verifyPageBytes(page []byte, pageIndex uint64, pageSize uint64) (PageHeader
 }
 
 func NewMerkleAccumulator(treeID string) *MerkleAccumulator {
-	return &MerkleAccumulator{
-		treeID: treeID,
-	}
+	return &MerkleAccumulator{treeID: treeID}
 }
 
-func (m *MerkleAccumulator) Count() uint64 {
-	return m.count
-}
+func (m *MerkleAccumulator) Count() uint64 { return m.count }
 
 func (m *MerkleAccumulator) AddLeaf(leaf [32]byte) {
 	node := leaf
@@ -1199,10 +1356,15 @@ func runVerify(cfg Config) error {
 		meta = dag + ".meta"
 	}
 
-	return verifyDagAgainstManifest(dag, meta)
+	sidecar := cfg.SidecarPath
+	if sidecar == "" {
+		sidecar = dag + defaultSidecarExt
+	}
+
+	return verifyDagAgainstManifest(dag, meta, sidecar)
 }
 
-func verifyDagAgainstManifest(dagPath, metaPath string) error {
+func verifyDagAgainstManifest(dagPath, metaPath, sidecarPath string) error {
 	manifest, err := readManifest(metaPath)
 	if err != nil {
 		return err
@@ -1212,15 +1374,16 @@ func verifyDagAgainstManifest(dagPath, metaPath string) error {
 		return err
 	}
 
-	if manifest.ManifestRoot != "" {
-		gotManifestRoot := "0x" + fmtHash(hashManifestRoot(manifest))
-		if !equalHexString(manifest.ManifestRoot, gotManifestRoot) {
-			return fmt.Errorf("ManifestRoot mismatch: meta=%s got=%s", manifest.ManifestRoot, gotManifestRoot)
-		}
+	gotManifestRoot := "0x" + fmtHash(hashManifestRoot(manifest))
+	if !equalHexString(manifest.ManifestRoot, gotManifestRoot) {
+		return fmt.Errorf("ManifestRoot mismatch: meta=%s got=%s", manifest.ManifestRoot, gotManifestRoot)
 	}
 
 	roots, err := computeRootsFromFile(dagPath, manifest.PageSize)
 	if err != nil {
+		return err
+	}
+	if err := validateRootsNonEmpty(roots, manifest); err != nil {
 		return err
 	}
 
@@ -1228,24 +1391,36 @@ func verifyDagAgainstManifest(dagPath, metaPath string) error {
 	gotTensor := "0x" + fmtHash(roots.TensorRoot)
 	gotPoW := "0x" + fmtHash(roots.PoWCommitRoot)
 
-	if manifest.AIDagRoot != "" && !equalHexString(manifest.AIDagRoot, gotAIDag) {
+	if !equalHexString(manifest.AIDagRoot, gotAIDag) {
 		return fmt.Errorf("AIDagRoot mismatch: meta=%s got=%s", manifest.AIDagRoot, gotAIDag)
 	}
-	if manifest.TensorRoot != "" && !equalHexString(manifest.TensorRoot, gotTensor) {
+	if !equalHexString(manifest.TensorRoot, gotTensor) {
 		return fmt.Errorf("TensorRoot mismatch: meta=%s got=%s", manifest.TensorRoot, gotTensor)
 	}
-	if manifest.PoWCommitRoot != "" && !equalHexString(manifest.PoWCommitRoot, gotPoW) {
+	if !equalHexString(manifest.PoWCommitRoot, gotPoW) {
 		return fmt.Errorf("PoWCommitRoot mismatch: meta=%s got=%s", manifest.PoWCommitRoot, gotPoW)
 	}
 
-	if manifest.AIDagLeafCount != 0 && manifest.AIDagLeafCount != roots.AIDagLeafCount {
+	if manifest.AIDagLeafCount != roots.AIDagLeafCount {
 		return fmt.Errorf("AIDagLeafCount mismatch: meta=%d got=%d", manifest.AIDagLeafCount, roots.AIDagLeafCount)
 	}
 	if manifest.TensorLeafCount != roots.TensorLeafCount {
 		return fmt.Errorf("TensorLeafCount mismatch: meta=%d got=%d", manifest.TensorLeafCount, roots.TensorLeafCount)
 	}
-	if manifest.PoWCommitLeafCount != 0 && manifest.PoWCommitLeafCount != roots.PoWCommitLeafCount {
+	if manifest.PoWCommitLeafCount != roots.PoWCommitLeafCount {
 		return fmt.Errorf("PoWCommitLeafCount mismatch: meta=%d got=%d", manifest.PoWCommitLeafCount, roots.PoWCommitLeafCount)
+	}
+
+	if sidecarPath == "" {
+		return errors.New("sidecar path is required in production verify mode")
+	}
+	sidecar, err := openMerkleSidecar(sidecarPath)
+	if err != nil {
+		return err
+	}
+	defer sidecar.Close()
+	if err := sidecar.validateAgainstManifest(manifest); err != nil {
+		return err
 	}
 
 	fmt.Println("verify OK")
@@ -1255,15 +1430,19 @@ func verifyDagAgainstManifest(dagPath, metaPath string) error {
 	fmt.Printf("AIDagLeafCount     : %d\n", roots.AIDagLeafCount)
 	fmt.Printf("TensorLeafCount    : %d\n", roots.TensorLeafCount)
 	fmt.Printf("PoWCommitLeafCount : %d\n", roots.PoWCommitLeafCount)
+	fmt.Printf("sidecar            : %s\n", sidecarPath)
 
 	return nil
 }
 
 func validateManifestBasics(manifest Manifest) error {
-	if manifest.HashAlgorithm != "" && manifest.HashAlgorithm != hashAlgorithm {
+	if manifest.Version != 0 && manifest.Version != manifestVersion {
+		return fmt.Errorf("unsupported manifest version: meta=%d want=%d", manifest.Version, manifestVersion)
+	}
+	if manifest.HashAlgorithm != hashAlgorithm {
 		return fmt.Errorf("unsupported hash algorithm: meta=%s want=%s", manifest.HashAlgorithm, hashAlgorithm)
 	}
-	if manifest.MerkleVersion != 0 && manifest.MerkleVersion != merkleVersion {
+	if manifest.MerkleVersion != merkleVersion {
 		return fmt.Errorf("unsupported merkle version: meta=%d want=%d", manifest.MerkleVersion, merkleVersion)
 	}
 	if manifest.HeaderSize != unifiedHeaderSize {
@@ -1293,6 +1472,33 @@ func validateManifestBasics(manifest Manifest) error {
 	if manifest.ModelPageCount != manifest.ModelEndPage-manifest.ModelStartPage {
 		return fmt.Errorf("modelPageCount mismatch: got=%d want=%d", manifest.ModelPageCount, manifest.ModelEndPage-manifest.ModelStartPage)
 	}
+	if manifest.AIDagLeafCount != manifest.TotalPages {
+		return fmt.Errorf("aidagLeafCount mismatch: got=%d want=%d", manifest.AIDagLeafCount, manifest.TotalPages)
+	}
+	if manifest.PoWCommitLeafCount != manifest.TotalPages {
+		return fmt.Errorf("powCommitLeafCount mismatch: got=%d want=%d", manifest.PoWCommitLeafCount, manifest.TotalPages)
+	}
+	if manifest.TensorLeafCount != manifest.ModelPageCount {
+		return fmt.Errorf("tensorLeafCount mismatch: got=%d want=%d", manifest.TensorLeafCount, manifest.ModelPageCount)
+	}
+	for _, c := range []struct {
+		name string
+		val  string
+	}{
+		{"AIDagRoot", manifest.AIDagRoot},
+		{"TensorRoot", manifest.TensorRoot},
+		{"PoWCommitRoot", manifest.PoWCommitRoot},
+		{"ManifestRoot", manifest.ManifestRoot},
+		{"ModelHash", manifest.ModelHash},
+	} {
+		h, err := decodeHex32(c.val)
+		if err != nil {
+			return fmt.Errorf("bad/empty %s: %w", c.name, err)
+		}
+		if isZeroHash(h) {
+			return fmt.Errorf("%s is zero", c.name)
+		}
+	}
 	return nil
 }
 
@@ -1309,6 +1515,9 @@ func runExtract(cfg Config) error {
 
 	manifest, err := readManifest(meta)
 	if err != nil {
+		return err
+	}
+	if err := validateManifestBasics(manifest); err != nil {
 		return err
 	}
 
@@ -1329,17 +1538,17 @@ func extractModel(dagPath, outPath string, manifest Manifest) error {
 	}
 	defer in.Close()
 
-	if dir := filepath.Dir(outPath); dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return err
-		}
+	if err := ensureParentDir(outPath); err != nil {
+		return err
 	}
 
-	out, err := os.OpenFile(outPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	tmpOut := tempPathFor(outPath)
+	defer os.Remove(tmpOut)
+
+	out, err := os.OpenFile(tmpOut, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 
 	page := make([]byte, manifest.PageSize)
 	var written uint64
@@ -1347,21 +1556,23 @@ func extractModel(dagPath, outPath string, manifest Manifest) error {
 	for p := manifest.ModelStartPage; p < manifest.ModelEndPage; p++ {
 		n, err := in.ReadAt(page, int64(p*manifest.PageSize))
 		if err != nil {
+			_ = out.Close()
 			return err
 		}
 		if uint64(n) != manifest.PageSize {
+			_ = out.Close()
 			return io.ErrUnexpectedEOF
 		}
 
-		hdr, payloadHash, pageCommit, err := verifyPageBytes(page, p, manifest.PageSize)
+		hdr, _, _, err := verifyPageBytes(page, p, manifest.PageSize)
 		if err != nil {
+			_ = out.Close()
 			return err
 		}
 		if hdr.PageType != PageTypeModel {
+			_ = out.Close()
 			return fmt.Errorf("expected model page at %d, got type %d", p, hdr.PageType)
 		}
-		_ = payloadHash
-		_ = pageCommit
 
 		payload := page[manifest.HeaderSize:]
 
@@ -1375,9 +1586,11 @@ func extractModel(dagPath, outPath string, manifest Manifest) error {
 
 		nw, err := out.Write(payload[:toWrite])
 		if err != nil {
+			_ = out.Close()
 			return err
 		}
 		if uint64(nw) != toWrite {
+			_ = out.Close()
 			return io.ErrShortWrite
 		}
 
@@ -1385,14 +1598,19 @@ func extractModel(dagPath, outPath string, manifest Manifest) error {
 	}
 
 	if written != manifest.ModelSize {
+		_ = out.Close()
 		return fmt.Errorf("extract size mismatch: wrote=%d want=%d", written, manifest.ModelSize)
 	}
 
 	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
 		return err
 	}
 
-	hash, size, err := hashFile(outPath)
+	hash, size, err := hashFile(tmpOut)
 	if err != nil {
 		return err
 	}
@@ -1401,8 +1619,12 @@ func extractModel(dagPath, outPath string, manifest Manifest) error {
 	if size != manifest.ModelSize {
 		return fmt.Errorf("extracted size mismatch: got=%d want=%d", size, manifest.ModelSize)
 	}
-	if manifest.ModelHash != "" && !equalHexString(manifest.ModelHash, got) {
+	if !equalHexString(manifest.ModelHash, got) {
 		return fmt.Errorf("extracted model hash mismatch: got=%s want=%s", got, manifest.ModelHash)
+	}
+
+	if err := commitAtomicPath(tmpOut, outPath, true); err != nil {
+		return err
 	}
 
 	fmt.Println("extract OK")
@@ -1462,6 +1684,10 @@ func runProve(cfg Config) error {
 	if meta == "" {
 		meta = cfg.DagPath + ".meta"
 	}
+	sidecarPath := cfg.SidecarPath
+	if sidecarPath == "" {
+		sidecarPath = cfg.DagPath + defaultSidecarExt
+	}
 
 	manifest, err := readManifest(meta)
 	if err != nil {
@@ -1470,22 +1696,22 @@ func runProve(cfg Config) error {
 	if err := validateManifestBasics(manifest); err != nil {
 		return err
 	}
-	if manifest.ManifestRoot != "" {
-		gotManifestRoot := "0x" + fmtHash(hashManifestRoot(manifest))
-		if !equalHexString(manifest.ManifestRoot, gotManifestRoot) {
-			return fmt.Errorf("ManifestRoot mismatch: meta=%s got=%s", manifest.ManifestRoot, gotManifestRoot)
-		}
+	gotManifestRoot := "0x" + fmtHash(hashManifestRoot(manifest))
+	if !equalHexString(manifest.ManifestRoot, gotManifestRoot) {
+		return fmt.Errorf("ManifestRoot mismatch: meta=%s got=%s", manifest.ManifestRoot, gotManifestRoot)
 	}
 
-	fmt.Println("building PoW/Tensor Merkle trees for proof generation...")
-	trees, err := buildProofTreesFromDAG(cfg.DagPath, manifest)
+	fmt.Println("opening mandatory Merkle sidecar tree for proof generation...")
+	sidecar, err := openMerkleSidecar(sidecarPath)
 	if err != nil {
 		return err
 	}
-
-	if err := compareProofTreeRootsWithManifest(trees, manifest); err != nil {
+	defer sidecar.Close()
+	if err := sidecar.validateAgainstManifest(manifest); err != nil {
 		return err
 	}
+
+	trees := ProofTrees{Sidecar: sidecar}
 
 	powSampleIndices, tensorSamplePages, requiredPages, err := deriveRequiredProofPages(manifest, cfg.BlockHash, cfg.Miner, cfg.Epoch, cfg.Nonce, cfg.Samples, cfg.TensorSamples)
 	if err != nil {
@@ -1500,7 +1726,7 @@ func runProve(cfg Config) error {
 			return err
 		}
 
-		powPath, err := trees.PoW.Proof(pageIndex)
+		powPath, err := trees.Sidecar.Proof(treePoW, pageIndex)
 		if err != nil {
 			return err
 		}
@@ -1516,7 +1742,7 @@ func runProve(cfg Config) error {
 				return fmt.Errorf("required tensor sample page %d is not a model page", pageIndex)
 			}
 			tensorIndex := pageIndex - manifest.ModelStartPage
-			tensorPath, err := trees.Tensor.Proof(tensorIndex)
+			tensorPath, err := trees.Sidecar.Proof(treeTensor, tensorIndex)
 			if err != nil {
 				return err
 			}
@@ -1567,25 +1793,17 @@ func runProve(cfg Config) error {
 		}
 	}
 
-	if dir := filepath.Dir(cfg.ProofPath); dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return err
-		}
-	}
-	if _, err := os.Stat(cfg.ProofPath); err == nil && !cfg.Force {
-		return fmt.Errorf("proof exists: %s ; use --force", cfg.ProofPath)
-	}
-
 	b, err := json.MarshalIndent(proof, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(cfg.ProofPath, b, 0644); err != nil {
+	if err := writeFileAtomic(cfg.ProofPath, b, 0644, cfg.Force); err != nil {
 		return err
 	}
 
 	fmt.Println("AISeal proof generated successfully")
 	fmt.Printf("proof              : %s\n", cfg.ProofPath)
+	fmt.Printf("sidecar            : %s\n", sidecarPath)
 	fmt.Printf("pow samples        : %d\n", len(powSampleIndices))
 	fmt.Printf("tensor samples     : %d\n", len(tensorSamplePages))
 	fmt.Printf("unique proof pages : %d\n", len(proofPages))
@@ -1650,75 +1868,445 @@ func runVerifyProof(cfg Config) error {
 	return nil
 }
 
-func buildProofTreesFromDAG(dagPath string, manifest Manifest) (ProofTrees, error) {
-	f, err := os.Open(dagPath)
+func buildMerkleSidecarTempFromDAG(dagPath, sidecarTmpPath string, manifest Manifest) (SidecarManifest, error) {
+	if err := validateManifestBasics(manifest); err != nil {
+		return SidecarManifest{}, err
+	}
+	if err := ensureParentDir(sidecarTmpPath); err != nil {
+		return SidecarManifest{}, err
+	}
+
+	f, err := os.OpenFile(sidecarTmpPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
 	if err != nil {
-		return ProofTrees{}, err
+		return SidecarManifest{}, err
 	}
 	defer f.Close()
 
-	powLeaves := make([][32]byte, 0, manifest.TotalPages)
-	tensorLeaves := make([][32]byte, 0, manifest.ModelPageCount)
+	if _, err := f.Write(make([]byte, sidecarHeaderReserved)); err != nil {
+		return SidecarManifest{}, fmt.Errorf("reserve sidecar header: %w", err)
+	}
+
+	dag, err := os.Open(dagPath)
+	if err != nil {
+		return SidecarManifest{}, err
+	}
+	defer dag.Close()
+
+	powLevel0 := SidecarLevel{Level: 0, Count: manifest.TotalPages, Offset: sidecarHeaderReserved, Bytes: manifest.TotalPages * hashSize}
+	powWriter := bufio.NewWriterSize(f, 4*1024*1024)
 	page := make([]byte, manifest.PageSize)
 
 	for pageIndex := uint64(0); pageIndex < manifest.TotalPages; pageIndex++ {
-		n, err := f.ReadAt(page, int64(pageIndex*manifest.PageSize))
+		n, err := dag.ReadAt(page, int64(pageIndex*manifest.PageSize))
 		if err != nil {
-			return ProofTrees{}, fmt.Errorf("read page %d: %w", pageIndex, err)
+			return SidecarManifest{}, fmt.Errorf("sidecar read page %d: %w", pageIndex, err)
 		}
 		if uint64(n) != manifest.PageSize {
-			return ProofTrees{}, io.ErrUnexpectedEOF
+			return SidecarManifest{}, io.ErrUnexpectedEOF
 		}
-
 		hdr, payloadHash, pageCommit, err := verifyPageBytes(page, pageIndex, manifest.PageSize)
 		if err != nil {
-			return ProofTrees{}, err
+			return SidecarManifest{}, err
 		}
-
-		powLeaves = append(powLeaves, merkleLeafHash(treePoW, hdr, payloadHash, pageCommit))
-		if hdr.PageType == PageTypeModel {
-			if hdr.ShardID != pageIndex-manifest.ModelStartPage {
-				return ProofTrees{}, fmt.Errorf("model shard mismatch at page %d: shard=%d expected=%d", pageIndex, hdr.ShardID, pageIndex-manifest.ModelStartPage)
-			}
-			tensorLeaves = append(tensorLeaves, merkleLeafHash(treeTensor, hdr, payloadHash, pageCommit))
+		leaf := merkleLeafHash(treePoW, hdr, payloadHash, pageCommit)
+		if _, err := powWriter.Write(leaf[:]); err != nil {
+			return SidecarManifest{}, err
 		}
-
 		if (pageIndex+1)%1000000 == 0 {
-			fmt.Printf("  proof-tree progress: page %d\n", pageIndex+1)
+			fmt.Printf("  sidecar pow leaves: page %d\n", pageIndex+1)
 		}
 	}
-
-	if uint64(len(powLeaves)) != manifest.TotalPages {
-		return ProofTrees{}, fmt.Errorf("pow leaf count mismatch: got=%d want=%d", len(powLeaves), manifest.TotalPages)
-	}
-	if uint64(len(tensorLeaves)) != manifest.ModelPageCount {
-		return ProofTrees{}, fmt.Errorf("tensor leaf count mismatch: got=%d want=%d", len(tensorLeaves), manifest.ModelPageCount)
+	if err := powWriter.Flush(); err != nil {
+		return SidecarManifest{}, err
 	}
 
-	return ProofTrees{
-		PoW:    NewMerkleTree(treePoW, powLeaves),
-		Tensor: NewMerkleTree(treeTensor, tensorLeaves),
-	}, nil
+	tensorOffset, err := currentOffset(f)
+	if err != nil {
+		return SidecarManifest{}, err
+	}
+	tensorLevel0 := SidecarLevel{Level: 0, Count: manifest.ModelPageCount, Offset: tensorOffset, Bytes: manifest.ModelPageCount * hashSize}
+	tensorWriter := bufio.NewWriterSize(f, 4*1024*1024)
+
+	for pageIndex := manifest.ModelStartPage; pageIndex < manifest.ModelEndPage; pageIndex++ {
+		n, err := dag.ReadAt(page, int64(pageIndex*manifest.PageSize))
+		if err != nil {
+			return SidecarManifest{}, fmt.Errorf("sidecar read tensor page %d: %w", pageIndex, err)
+		}
+		if uint64(n) != manifest.PageSize {
+			return SidecarManifest{}, io.ErrUnexpectedEOF
+		}
+		hdr, payloadHash, pageCommit, err := verifyPageBytes(page, pageIndex, manifest.PageSize)
+		if err != nil {
+			return SidecarManifest{}, err
+		}
+		if hdr.PageType != PageTypeModel {
+			return SidecarManifest{}, fmt.Errorf("sidecar expected model page at %d, got type %d", pageIndex, hdr.PageType)
+		}
+		if hdr.ShardID != pageIndex-manifest.ModelStartPage {
+			return SidecarManifest{}, fmt.Errorf("sidecar model shard mismatch at page %d: shard=%d expected=%d", pageIndex, hdr.ShardID, pageIndex-manifest.ModelStartPage)
+		}
+		leaf := merkleLeafHash(treeTensor, hdr, payloadHash, pageCommit)
+		if _, err := tensorWriter.Write(leaf[:]); err != nil {
+			return SidecarManifest{}, err
+		}
+	}
+	if err := tensorWriter.Flush(); err != nil {
+		return SidecarManifest{}, err
+	}
+
+	powLevels, err := appendSidecarUpperLevels(f, treePoW, []SidecarLevel{powLevel0})
+	if err != nil {
+		return SidecarManifest{}, err
+	}
+	tensorLevels, err := appendSidecarUpperLevels(f, treeTensor, []SidecarLevel{tensorLevel0})
+	if err != nil {
+		return SidecarManifest{}, err
+	}
+
+	powRoot, err := readSidecarRoot(f, powLevels)
+	if err != nil {
+		return SidecarManifest{}, err
+	}
+	tensorRoot, err := readSidecarRoot(f, tensorLevels)
+	if err != nil {
+		return SidecarManifest{}, err
+	}
+	manifestPowRoot, err := decodeHex32(manifest.PoWCommitRoot)
+	if err != nil {
+		return SidecarManifest{}, err
+	}
+	manifestTensorRoot, err := decodeHex32(manifest.TensorRoot)
+	if err != nil {
+		return SidecarManifest{}, err
+	}
+	if powRoot != manifestPowRoot {
+		return SidecarManifest{}, fmt.Errorf("sidecar PoW root mismatch: got=0x%s want=%s", fmtHash(powRoot), manifest.PoWCommitRoot)
+	}
+	if tensorRoot != manifestTensorRoot {
+		return SidecarManifest{}, fmt.Errorf("sidecar Tensor root mismatch: got=0x%s want=%s", fmtHash(tensorRoot), manifest.TensorRoot)
+	}
+
+	sm := SidecarManifest{
+		Version:        sidecarVersion,
+		HashAlgorithm:  hashAlgorithm,
+		MerkleVersion:  merkleVersion,
+		CreatedAt:      time.Now().UTC().Format(time.RFC3339),
+		PageSize:       manifest.PageSize,
+		HeaderSize:     manifest.HeaderSize,
+		PayloadSize:    manifest.PayloadSize,
+		TotalPages:     manifest.TotalPages,
+		ModelStartPage: manifest.ModelStartPage,
+		ModelPageCount: manifest.ModelPageCount,
+		ManifestRoot:   normalizeHexString(manifest.ManifestRoot),
+		AIDagRoot:      normalizeHexString(manifest.AIDagRoot),
+		TensorRoot:     normalizeHexString(manifest.TensorRoot),
+		PoWCommitRoot:  normalizeHexString(manifest.PoWCommitRoot),
+		PoWLevels:      powLevels,
+		TensorLevels:   tensorLevels,
+	}
+
+	if err := writeSidecarHeader(f, sm); err != nil {
+		return SidecarManifest{}, err
+	}
+	if err := f.Sync(); err != nil {
+		return SidecarManifest{}, err
+	}
+
+	fmt.Printf("  sidecar pow levels    : %d\n", len(powLevels))
+	fmt.Printf("  sidecar tensor levels : %d\n", len(tensorLevels))
+	fmt.Printf("  sidecar pow root      : 0x%s\n", fmtHash(powRoot))
+	fmt.Printf("  sidecar tensor root   : 0x%s\n", fmtHash(tensorRoot))
+
+	return sm, nil
+}
+
+func appendSidecarUpperLevels(f *os.File, treeID string, levels []SidecarLevel) ([]SidecarLevel, error) {
+	for levels[len(levels)-1].Count > 1 {
+		prev := levels[len(levels)-1]
+		if prev.Bytes != prev.Count*hashSize {
+			return nil, fmt.Errorf("bad sidecar level bytes: level=%d bytes=%d count=%d", prev.Level, prev.Bytes, prev.Count)
+		}
+
+		nextCount := (prev.Count + 1) / 2
+		nextOffset, err := currentOffset(f)
+		if err != nil {
+			return nil, err
+		}
+		next := SidecarLevel{Level: prev.Level + 1, Count: nextCount, Offset: nextOffset, Bytes: nextCount * hashSize}
+
+		section := io.NewSectionReader(f, int64(prev.Offset), int64(prev.Bytes))
+		writer := bufio.NewWriterSize(f, 4*1024*1024)
+
+		for i := uint64(0); i < prev.Count; i += 2 {
+			left, err := readHashFromReader(section)
+			if err != nil {
+				return nil, err
+			}
+			parent := left
+			if i+1 < prev.Count {
+				right, err := readHashFromReader(section)
+				if err != nil {
+					return nil, err
+				}
+				parent = merkleNodeHash(treeID, left, right)
+			}
+			if _, err := writer.Write(parent[:]); err != nil {
+				return nil, err
+			}
+		}
+		if err := writer.Flush(); err != nil {
+			return nil, err
+		}
+
+		levels = append(levels, next)
+		fmt.Printf("  sidecar %s level %d count %d\n", treeID, next.Level, next.Count)
+	}
+	return levels, nil
+}
+
+func readSidecarRoot(f *os.File, levels []SidecarLevel) ([32]byte, error) {
+	var out [32]byte
+	if len(levels) == 0 {
+		return out, errors.New("empty sidecar levels")
+	}
+	last := levels[len(levels)-1]
+	if last.Count != 1 || last.Bytes != hashSize {
+		return out, fmt.Errorf("bad sidecar root level: level=%d count=%d bytes=%d", last.Level, last.Count, last.Bytes)
+	}
+	_, err := f.ReadAt(out[:], int64(last.Offset))
+	return out, err
+}
+
+func writeSidecarHeader(f *os.File, sm SidecarManifest) error {
+	b, err := json.Marshal(sm)
+	if err != nil {
+		return err
+	}
+	if uint64(len(b))+16 > sidecarHeaderReserved {
+		return fmt.Errorf("sidecar header too large: %d > reserved %d", len(b)+16, sidecarHeaderReserved)
+	}
+
+	buf := make([]byte, sidecarHeaderReserved)
+	copy(buf[0:8], []byte(sidecarMagic))
+	binary.LittleEndian.PutUint64(buf[8:16], uint64(len(b)))
+	copy(buf[16:], b)
+	_, err = f.WriteAt(buf, 0)
+	return err
+}
+
+func openMerkleSidecar(path string) (*MerkleSidecarReader, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open sidecar: %w", err)
+	}
+
+	prefix := make([]byte, 16)
+	if _, err := f.ReadAt(prefix, 0); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if string(prefix[0:8]) != sidecarMagic {
+		_ = f.Close()
+		return nil, fmt.Errorf("bad sidecar magic: %q", string(prefix[0:8]))
+	}
+	headerLen := binary.LittleEndian.Uint64(prefix[8:16])
+	if headerLen == 0 || headerLen+16 > sidecarHeaderReserved {
+		_ = f.Close()
+		return nil, fmt.Errorf("bad sidecar header length: %d", headerLen)
+	}
+	header := make([]byte, headerLen)
+	if _, err := f.ReadAt(header, 16); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+
+	var sm SidecarManifest
+	if err := json.Unmarshal(header, &sm); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+
+	r := &MerkleSidecarReader{path: path, file: f, meta: sm}
+	if err := r.validateSelf(); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *MerkleSidecarReader) Close() error {
+	if r == nil || r.file == nil {
+		return nil
+	}
+	return r.file.Close()
+}
+
+func (r *MerkleSidecarReader) validateSelf() error {
+	if r.meta.Version != sidecarVersion {
+		return fmt.Errorf("unsupported sidecar version: got=%d want=%d", r.meta.Version, sidecarVersion)
+	}
+	if r.meta.HashAlgorithm != hashAlgorithm {
+		return fmt.Errorf("unsupported sidecar hash algorithm: got=%s want=%s", r.meta.HashAlgorithm, hashAlgorithm)
+	}
+	if r.meta.MerkleVersion != merkleVersion {
+		return fmt.Errorf("unsupported sidecar merkle version: got=%d want=%d", r.meta.MerkleVersion, merkleVersion)
+	}
+	if r.meta.PageSize <= unifiedHeaderSize {
+		return fmt.Errorf("bad sidecar page size: %d", r.meta.PageSize)
+	}
+	for name, levels := range map[string][]SidecarLevel{
+		treePoW:    r.meta.PoWLevels,
+		treeTensor: r.meta.TensorLevels,
+	} {
+		if err := validateSidecarLevels(name, levels); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateSidecarLevels(treeID string, levels []SidecarLevel) error {
+	if len(levels) == 0 {
+		return fmt.Errorf("sidecar %s has no levels", treeID)
+	}
+	for i, level := range levels {
+		if level.Level != i {
+			return fmt.Errorf("sidecar %s level index mismatch: got=%d want=%d", treeID, level.Level, i)
+		}
+		if level.Count == 0 {
+			return fmt.Errorf("sidecar %s level %d count is zero", treeID, i)
+		}
+		if level.Bytes != level.Count*hashSize {
+			return fmt.Errorf("sidecar %s level %d bytes mismatch: got=%d want=%d", treeID, i, level.Bytes, level.Count*hashSize)
+		}
+		if i > 0 {
+			want := (levels[i-1].Count + 1) / 2
+			if level.Count != want {
+				return fmt.Errorf("sidecar %s level %d count mismatch: got=%d want=%d", treeID, i, level.Count, want)
+			}
+		}
+	}
+	last := levels[len(levels)-1]
+	if last.Count != 1 {
+		return fmt.Errorf("sidecar %s root level count is %d", treeID, last.Count)
+	}
+	return nil
+}
+
+func (r *MerkleSidecarReader) validateAgainstManifest(manifest Manifest) error {
+	if r.meta.PageSize != manifest.PageSize {
+		return fmt.Errorf("sidecar pageSize mismatch: sidecar=%d manifest=%d", r.meta.PageSize, manifest.PageSize)
+	}
+	if r.meta.HeaderSize != manifest.HeaderSize {
+		return fmt.Errorf("sidecar headerSize mismatch: sidecar=%d manifest=%d", r.meta.HeaderSize, manifest.HeaderSize)
+	}
+	if r.meta.PayloadSize != manifest.PayloadSize {
+		return fmt.Errorf("sidecar payloadSize mismatch: sidecar=%d manifest=%d", r.meta.PayloadSize, manifest.PayloadSize)
+	}
+	if r.meta.TotalPages != manifest.TotalPages {
+		return fmt.Errorf("sidecar totalPages mismatch: sidecar=%d manifest=%d", r.meta.TotalPages, manifest.TotalPages)
+	}
+	if r.meta.ModelStartPage != manifest.ModelStartPage || r.meta.ModelPageCount != manifest.ModelPageCount {
+		return fmt.Errorf("sidecar model range mismatch: sidecar=%d/%d manifest=%d/%d", r.meta.ModelStartPage, r.meta.ModelPageCount, manifest.ModelStartPage, manifest.ModelPageCount)
+	}
+	checks := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"ManifestRoot", r.meta.ManifestRoot, manifest.ManifestRoot},
+		{"AIDagRoot", r.meta.AIDagRoot, manifest.AIDagRoot},
+		{"TensorRoot", r.meta.TensorRoot, manifest.TensorRoot},
+		{"PoWCommitRoot", r.meta.PoWCommitRoot, manifest.PoWCommitRoot},
+	}
+	for _, c := range checks {
+		if !equalHexString(c.got, c.want) {
+			return fmt.Errorf("sidecar %s mismatch: sidecar=%s manifest=%s", c.name, c.got, c.want)
+		}
+	}
+	if len(r.meta.PoWLevels) == 0 || r.meta.PoWLevels[0].Count != manifest.PoWCommitLeafCount {
+		return fmt.Errorf("sidecar PoW leaf count mismatch: sidecar=%d manifest=%d", firstLevelCount(r.meta.PoWLevels), manifest.PoWCommitLeafCount)
+	}
+	if len(r.meta.TensorLevels) == 0 || r.meta.TensorLevels[0].Count != manifest.TensorLeafCount {
+		return fmt.Errorf("sidecar Tensor leaf count mismatch: sidecar=%d manifest=%d", firstLevelCount(r.meta.TensorLevels), manifest.TensorLeafCount)
+	}
+	return nil
+}
+
+func (r *MerkleSidecarReader) Proof(treeID string, leafIndex uint64) ([]MerkleProofStep, error) {
+	levels, err := r.levels(treeID)
+	if err != nil {
+		return nil, err
+	}
+	if len(levels) == 0 {
+		return nil, errors.New("cannot prove empty sidecar tree")
+	}
+	if leafIndex >= levels[0].Count {
+		return nil, fmt.Errorf("leaf index out of range: %d >= %d", leafIndex, levels[0].Count)
+	}
+
+	idx := leafIndex
+	proof := make([]MerkleProofStep, 0, len(levels)-1)
+	for levelIdx := 0; levelIdx < len(levels)-1; levelIdx++ {
+		level := levels[levelIdx]
+		if idx%2 == 0 {
+			if idx+1 < level.Count {
+				sibling, err := r.readLevelHash(level, idx+1)
+				if err != nil {
+					return nil, err
+				}
+				proof = append(proof, MerkleProofStep{Side: ProofSideRight, Hash: "0x" + fmtHash(sibling)})
+			}
+		} else {
+			sibling, err := r.readLevelHash(level, idx-1)
+			if err != nil {
+				return nil, err
+			}
+			proof = append(proof, MerkleProofStep{Side: ProofSideLeft, Hash: "0x" + fmtHash(sibling)})
+		}
+		idx /= 2
+	}
+	return proof, nil
+}
+
+func (r *MerkleSidecarReader) levels(treeID string) ([]SidecarLevel, error) {
+	switch treeID {
+	case treePoW:
+		return r.meta.PoWLevels, nil
+	case treeTensor:
+		return r.meta.TensorLevels, nil
+	default:
+		return nil, fmt.Errorf("unknown sidecar tree: %s", treeID)
+	}
+}
+
+func (r *MerkleSidecarReader) readLevelHash(level SidecarLevel, index uint64) ([32]byte, error) {
+	var out [32]byte
+	if index >= level.Count {
+		return out, fmt.Errorf("sidecar level %d index out of range: %d >= %d", level.Level, index, level.Count)
+	}
+	_, err := r.file.ReadAt(out[:], int64(level.Offset+index*hashSize))
+	return out, err
+}
+
+func buildProofTreesFromDAG(dagPath string, manifest Manifest) (ProofTrees, error) {
+	sidecarPath := dagPath + defaultSidecarExt
+	sidecar, err := openMerkleSidecar(sidecarPath)
+	if err != nil {
+		return ProofTrees{}, err
+	}
+	if err := sidecar.validateAgainstManifest(manifest); err != nil {
+		_ = sidecar.Close()
+		return ProofTrees{}, err
+	}
+	return ProofTrees{Sidecar: sidecar}, nil
 }
 
 func compareProofTreeRootsWithManifest(trees ProofTrees, manifest Manifest) error {
-	powRoot, err := decodeHex32(manifest.PoWCommitRoot)
-	if err != nil {
-		return fmt.Errorf("bad manifest PoWCommitRoot: %w", err)
+	if trees.Sidecar == nil {
+		return errors.New("missing sidecar proof tree")
 	}
-	if trees.PoW.Root() != powRoot {
-		return fmt.Errorf("PoW tree root mismatch: got=0x%s meta=%s", fmtHash(trees.PoW.Root()), manifest.PoWCommitRoot)
-	}
-
-	tensorRoot, err := decodeHex32(manifest.TensorRoot)
-	if err != nil {
-		return fmt.Errorf("bad manifest TensorRoot: %w", err)
-	}
-	if trees.Tensor.Root() != tensorRoot {
-		return fmt.Errorf("Tensor tree root mismatch: got=0x%s meta=%s", fmtHash(trees.Tensor.Root()), manifest.TensorRoot)
-	}
-
-	return nil
+	return trees.Sidecar.validateAgainstManifest(manifest)
 }
 
 func deriveRequiredProofPages(manifest Manifest, blockHash string, miner string, epoch uint64, nonce uint64, powSamples int, tensorSamples int) ([]uint64, []uint64, []uint64, error) {
@@ -1756,10 +2344,7 @@ func deriveRequiredProofPages(manifest Manifest, blockHash string, miner string,
 }
 
 func sampleUniqueIndices(domain string, manifest Manifest, blockHash string, miner string, epoch uint64, nonce uint64, count uint64, start uint64, span uint64) []uint64 {
-	if count == 0 {
-		return nil
-	}
-	if span == 0 {
+	if count == 0 || span == 0 {
 		return nil
 	}
 
@@ -1866,7 +2451,10 @@ func computeMixDigest(seal AISeal, manifest Manifest, powSampleIndices []uint64,
 
 		writeUint64(w, uint64(len(powSampleIndices)))
 		for _, pageIndex := range powSampleIndices {
-			mat := matByIndex[pageIndex]
+			mat, ok := matByIndex[pageIndex]
+			if !ok {
+				continue
+			}
 			writeUint64(w, pageIndex)
 			writeUint16(w, mat.Header.PageType)
 			writeFixed32(w, mat.PayloadHash)
@@ -1876,7 +2464,10 @@ func computeMixDigest(seal AISeal, manifest Manifest, powSampleIndices []uint64,
 
 		writeUint64(w, uint64(len(tensorSamplePages)))
 		for _, pageIndex := range tensorSamplePages {
-			mat := matByIndex[pageIndex]
+			mat, ok := matByIndex[pageIndex]
+			if !ok {
+				continue
+			}
 			writeUint64(w, pageIndex)
 			writeUint64(w, mat.Header.ShardID)
 			writeUint64(w, mat.Header.ModelOffset)
@@ -1902,7 +2493,10 @@ func computeAIDigest(seal AISeal, manifest Manifest, tensorSamplePages []uint64,
 		writeUint64(w, uint64(len(tensorSamplePages)))
 
 		for _, pageIndex := range tensorSamplePages {
-			mat := matByIndex[pageIndex]
+			mat, ok := matByIndex[pageIndex]
+			if !ok {
+				continue
+			}
 			writeUint64(w, pageIndex)
 			writeUint64(w, mat.Header.ShardID)
 			writeUint64(w, mat.Header.ModelOffset)
@@ -1910,8 +2504,6 @@ func computeAIDigest(seal AISeal, manifest Manifest, tensorSamplePages []uint64,
 			writeFixed32(w, mat.PayloadHash)
 			writeFixed32(w, mat.PageCommit)
 
-			// Lightweight deterministic page challenge. This is not full LLM inference;
-			// it makes the validator recompute a small fixed digest from sampled model bytes.
 			challenge := lightweightTensorPageChallenge(seal, pageIndex, mat.Payload)
 			writeFixed32(w, challenge)
 		}
@@ -1933,8 +2525,6 @@ func lightweightTensorPageChallenge(seal AISeal, pageIndex uint64, payload []byt
 			writeUint64(sw, pageIndex)
 		})
 
-		// Read deterministic 32 small windows from the model page.
-		// This keeps validator work light while forcing the miner to reveal real bytes.
 		for i := uint64(0); i < 32; i++ {
 			h := blake3HashTagged(domainAIDigest, func(hw io.Writer) {
 				writeFixed32(hw, seed)
@@ -2204,8 +2794,7 @@ func writeManifest(path string, manifest Manifest) error {
 	if err != nil {
 		return err
 	}
-
-	return os.WriteFile(path, b, 0644)
+	return writeFileAtomic(path, b, 0644, true)
 }
 
 func hashFile(path string) ([32]byte, uint64, error) {
@@ -2268,9 +2857,7 @@ func blake3HashTagged(domain string, writeFn func(io.Writer)) [32]byte {
 	return finalizeHash(h)
 }
 
-func finalizeHash(h interface {
-	Sum([]byte) []byte
-}) [32]byte {
+func finalizeHash(h interface{ Sum([]byte) []byte }) [32]byte {
 	sum := h.Sum(nil)
 
 	var out [32]byte
@@ -2279,18 +2866,14 @@ func finalizeHash(h interface {
 	return out
 }
 
-func writeString(w io.Writer, s string) {
-	writeBytes(w, []byte(s))
-}
+func writeString(w io.Writer, s string) { writeBytes(w, []byte(s)) }
 
 func writeBytes(w io.Writer, b []byte) {
 	writeUint64(w, uint64(len(b)))
 	_, _ = w.Write(b)
 }
 
-func writeFixed32(w io.Writer, h [32]byte) {
-	_, _ = w.Write(h[:])
-}
+func writeFixed32(w io.Writer, h [32]byte) { _, _ = w.Write(h[:]) }
 
 func writeUint16(w io.Writer, v uint16) {
 	var b [2]byte
@@ -2310,9 +2893,7 @@ func writeUint64(w io.Writer, v uint64) {
 	_, _ = w.Write(b[:])
 }
 
-func fmtHash(h [32]byte) string {
-	return fmt.Sprintf("%x", h[:])
-}
+func fmtHash(h [32]byte) string { return fmt.Sprintf("%x", h[:]) }
 
 func decodeHex32(s string) ([32]byte, error) {
 	var out [32]byte
@@ -2375,9 +2956,7 @@ func isHexString(s string) bool {
 	return true
 }
 
-func equalHexString(a, b string) bool {
-	return normalizeHexString(a) == normalizeHexString(b)
-}
+func equalHexString(a, b string) bool { return normalizeHexString(a) == normalizeHexString(b) }
 
 func hashMeetsTarget(hash [32]byte, target [32]byte) bool {
 	return bytes.Compare(hash[:], target[:]) <= 0
@@ -2444,4 +3023,171 @@ func printProgress(start time.Time, written, total uint64) {
 		mbs,
 		eta,
 	)
+}
+
+func validateRootsNonEmpty(roots Roots, manifest Manifest) error {
+	checks := []struct {
+		name      string
+		root      [32]byte
+		count     uint64
+		emptyHash [32]byte
+	}{
+		{"AIDagRoot", roots.AIDagRoot, roots.AIDagLeafCount, merkleEmptyHash(treeAIDag)},
+		{"TensorRoot", roots.TensorRoot, roots.TensorLeafCount, merkleEmptyHash(treeTensor)},
+		{"PoWCommitRoot", roots.PoWCommitRoot, roots.PoWCommitLeafCount, merkleEmptyHash(treePoW)},
+	}
+	for _, c := range checks {
+		if c.count == 0 {
+			return fmt.Errorf("%s leaf count is zero", c.name)
+		}
+		if isZeroHash(c.root) {
+			return fmt.Errorf("%s is zero", c.name)
+		}
+		if c.root == c.emptyHash {
+			return fmt.Errorf("%s equals empty-tree hash despite count=%d", c.name, c.count)
+		}
+	}
+	if roots.AIDagLeafCount != manifest.TotalPages {
+		return fmt.Errorf("AIDagLeafCount mismatch: got=%d want=%d", roots.AIDagLeafCount, manifest.TotalPages)
+	}
+	if roots.PoWCommitLeafCount != manifest.TotalPages {
+		return fmt.Errorf("PoWCommitLeafCount mismatch: got=%d want=%d", roots.PoWCommitLeafCount, manifest.TotalPages)
+	}
+	if roots.TensorLeafCount != manifest.ModelPageCount {
+		return fmt.Errorf("TensorLeafCount mismatch: got=%d want=%d", roots.TensorLeafCount, manifest.ModelPageCount)
+	}
+	return nil
+}
+
+func isZeroHash(h [32]byte) bool {
+	var z [32]byte
+	return h == z
+}
+
+func readHashFromReader(r io.Reader) ([32]byte, error) {
+	var h [32]byte
+	_, err := io.ReadFull(r, h[:])
+	return h, err
+}
+
+func currentOffset(f *os.File) (uint64, error) {
+	off, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, err
+	}
+	return uint64(off), nil
+}
+
+func firstLevelCount(levels []SidecarLevel) uint64 {
+	if len(levels) == 0 {
+		return 0
+	}
+	return levels[0].Count
+}
+
+func firstMissingPage(seen []uint8) uint64 {
+	for i, v := range seen {
+		if v == 0 {
+			return uint64(i)
+		}
+	}
+	return ^uint64(0)
+}
+
+func maxInt() int { return int(^uint(0) >> 1) }
+
+func preflightAtomicTargets(force bool, paths ...string) error {
+	if force {
+		return nil
+	}
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		if _, err := os.Stat(p); err == nil {
+			return fmt.Errorf("output exists: %s ; use --force", p)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureParentDir(path string) error {
+	dir := filepath.Dir(path)
+	if dir == "." || dir == "" {
+		return nil
+	}
+	return os.MkdirAll(dir, 0755)
+}
+
+func tempPathFor(path string) string {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	return filepath.Join(dir, fmt.Sprintf(".%s.tmp.%d.%d", base, os.Getpid(), time.Now().UnixNano()))
+}
+
+func commitAtomicPath(tmpPath, finalPath string, force bool) error {
+	if !force {
+		if _, err := os.Stat(finalPath); err == nil {
+			return fmt.Errorf("target exists: %s ; use --force", finalPath)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	} else {
+		if err := os.Remove(finalPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		return err
+	}
+	return fsyncDir(filepath.Dir(finalPath))
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode, force bool) error {
+	if err := ensureParentDir(path); err != nil {
+		return err
+	}
+	if !force {
+		if _, err := os.Stat(path); err == nil {
+			return fmt.Errorf("target exists: %s ; use --force", path)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+
+	tmp := tempPathFor(path)
+	defer os.Remove(tmp)
+
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return commitAtomicPath(tmp, path, force)
+}
+
+func fsyncDir(dir string) error {
+	if dir == "" {
+		dir = "."
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return nil // best effort; some platforms/filesystems reject directory open/sync
+	}
+	defer d.Close()
+	_ = d.Sync()
+	return nil
 }
