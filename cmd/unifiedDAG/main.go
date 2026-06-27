@@ -1,5 +1,3 @@
-了解です。下をそのまま aidag_aiseal_lightverify.go に貼り付けて使ってください。
-
 package main
 import (
 	"bytes"
