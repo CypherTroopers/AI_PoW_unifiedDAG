@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/CypherTroopers/AI_PoW_unifiedDAG/internal/aiseal"
 	"github.com/zeebo/blake3"
 )
 
@@ -1829,40 +1830,29 @@ func runVerifyProof(cfg Config) error {
 		}
 	}
 
-	manifest, err := readManifest(meta)
+	manifestBytes, err := os.ReadFile(meta)
 	if err != nil {
 		return err
 	}
-	if err := validateManifestBasics(manifest); err != nil {
-		return err
-	}
-
-	proof, err := readAISealProof(cfg.ProofPath)
+	manifest, err := aiseal.LoadManifestBytes(manifestBytes)
 	if err != nil {
 		return err
 	}
-
-	workHash, proofHash, err := verifyAISealProof(manifest, proof)
+	proofBytes, err := os.ReadFile(cfg.ProofPath)
 	if err != nil {
 		return err
 	}
-
-	if cfg.Target != "" {
-		target, err := decodeHex32(cfg.Target)
-		if err != nil {
-			return fmt.Errorf("bad --target: %w", err)
-		}
-		if !hashMeetsTarget(workHash, target) {
-			return fmt.Errorf("work hash does not meet target: work=0x%s target=%s", fmtHash(workHash), normalizeHexString(cfg.Target))
-		}
+	result, proof, err := aiseal.VerifyBytes(manifest, proofBytes, cfg.Target, aiseal.DefaultLimits())
+	if err != nil {
+		return err
 	}
 
 	fmt.Println("AISeal light verify OK")
 	fmt.Printf("proof              : %s\n", cfg.ProofPath)
 	fmt.Printf("mixDigest          : %s\n", proof.Seal.MixDigest)
 	fmt.Printf("aiDigest           : %s\n", proof.Seal.AIDigest)
-	fmt.Printf("workHash           : 0x%s\n", fmtHash(workHash))
-	fmt.Printf("proofHash          : 0x%s\n", fmtHash(proofHash))
+	fmt.Printf("workHash           : %s\n", result.WorkHash)
+	fmt.Printf("proofHash          : %s\n", result.ProofHash)
 	fmt.Printf("verified pages     : %d\n", len(proof.Pages))
 
 	return nil

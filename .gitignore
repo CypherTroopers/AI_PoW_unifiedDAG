@@ -1,0 +1,7 @@
+/bin/
+*.exe
+*.test
+*.bin
+*.bin.meta
+*.bin.sidecar
+aiseal-proof.json
